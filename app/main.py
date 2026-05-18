@@ -172,6 +172,10 @@ def _sort_financial_years(years: list[str]) -> list[str]:
 
 # ── System endpoints ──────────────────────────────────────────────────────────
 
+@app.get("/")
+async def home():
+    return {"message": "API running successfully"}
+
 @app.get("/health", tags=["System"])
 def health():
     return {"status": "ok", "version": "3.0.0"}
