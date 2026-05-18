@@ -11,3 +11,4 @@ Pillow==10.3.0
 pandas==2.2.2
 filelock==3.14.0
 numpy==1.26.4
+Pillow==10.4.0
