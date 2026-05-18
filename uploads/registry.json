@@ -1,0 +1,35 @@
+{
+  "companies": {
+    "cll": {
+      "slug": "cll",
+      "display_name": "CLL",
+      "created_at": "2026-05-18T06:15:01+00:00",
+      "documents": [
+        {
+          "doc_id": "25391aeb4bd745ac84b0eeb91d607121",
+          "filename": "CLL FY 2022-23 Standalone Financials.pdf",
+          "stored_name": "25391aeb4bd745ac84b0eeb91d607121_CLL_FY_2022-23_Standalone_Financials.pdf",
+          "size_bytes": 3242081,
+          "sha256": "3e9ed905276ca121ce81a8b008fc635fd53c6ba5f785c858f0305c175666bd4b",
+          "uploaded_at": "2026-05-18T06:15:01+00:00"
+        },
+        {
+          "doc_id": "7a31805787294794a32163d93253e5c2",
+          "filename": "CLL Standalone Financials AY 24-25.pdf",
+          "stored_name": "7a31805787294794a32163d93253e5c2_CLL_Standalone_Financials_AY_24-25.pdf",
+          "size_bytes": 14206689,
+          "sha256": "e468495abe3f99c9fc5ea089cabaa66777a648747f7712ec017d467123b98795",
+          "uploaded_at": "2026-05-18T06:55:32+00:00"
+        },
+        {
+          "doc_id": "16dab2f6f58d47ee8e0ddd46ed033edd",
+          "filename": "Financials 24-25(standalone).pdf",
+          "stored_name": "16dab2f6f58d47ee8e0ddd46ed033edd_Financials_24-25_standalone_.pdf",
+          "size_bytes": 15033190,
+          "sha256": "26b4b2a4e6d5e587607569d68d2eb45e38cd5d9a3632091e648b09a0df5d079a",
+          "uploaded_at": "2026-05-18T06:55:49+00:00"
+        }
+      ]
+    }
+  }
+}
