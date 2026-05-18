@@ -25,8 +25,5 @@ RUN mkdir -p /data/uploads /data/temp
 ENV UPLOADS_ROOT=/data/uploads
 ENV TEMP_DIR=/data/temp
 
-EXPOSE 8000
-
-
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
 EXPOSE 8000
