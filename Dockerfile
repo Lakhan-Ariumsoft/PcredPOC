@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     poppler-utils \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
-
+ 
 WORKDIR /app
 
 # Install Python deps first (layer caching — only rebuilt on requirements change)
