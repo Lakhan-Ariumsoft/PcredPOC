@@ -1,17 +1,16 @@
 """
-CMA Extraction API  v6.0 — Async background extraction
+CMA Extraction API v7.0
 
-New flow:
-1. POST /extract/trigger/{company_slug}  → starts background job, returns job_id immediately
-2. GET  /extract/status/{job_id}         → poll for progress (pending/running/done/error)
-3. GET  /extract/result/{job_id}         → get final merged CMA data when done
-
-Old sync endpoint still works if result is already cached (instant response).
+Cache strategy:
+- Upload a doc → OCR cached immediately on first extraction
+- On extract trigger → check AI cache first, skip if hit
+- New file uploaded → old AI cache for that doc auto-invalidated
+- DELETE /cache/all → wipe everything (OCR + AI)
 """
 import logging, os, uuid, threading
 from pathlib import Path
-from typing import Optional
 from datetime import datetime
+from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -19,15 +18,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.cma_fields   import CMA_SECTIONS
-from app.extractor_ai import extract_cma_fields, clear_ai_cache
+from app.extractor_ai import extract_cma_fields, clear_ai_cache, clear_all_ai_caches
 from app.merger       import merge_documents
-from app.pdf_reader   import extract_all_text, get_financial_year
+from app.pdf_reader   import (
+    extract_all_text, get_financial_year,
+    clear_all_ocr_caches, clear_ocr_cache_for,
+)
 from app.storage      import (
     DuplicateDocumentError, delete_document, get_document_path,
     list_all_documents, list_company_documents, store_document,
 )
 
 load_dotenv()
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -36,8 +39,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="CMA Extraction API",
-    description="Upload financial PDFs per company. AI extracts all CMA fields year-wise.",
-    version="6.0.0",
+    description="Upload financial PDFs. AI extracts 199 CMA fields across financial years.",
+    version="7.0.0",
 )
 
 app.add_middleware(
@@ -52,7 +55,6 @@ TEMP_DIR = Path(os.environ.get("TEMP_DIR", "temp"))
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── In-memory job store ───────────────────────────────────────────────────────
-# { job_id: { status, company_slug, progress, total, message, result, error, started_at } }
 _jobs: dict = {}
 _jobs_lock = threading.Lock()
 
@@ -69,29 +71,33 @@ def _job_update(job_id: str, **kwargs):
         if job_id in _jobs:
             _jobs[job_id].update(kwargs)
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _require_pdf(file: UploadFile):
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(400, "Only PDF files are accepted.")
-
-def _read_bytes(file: UploadFile) -> bytes:
-    data = file.file.read()
-    if not data:
-        raise HTTPException(400, "Uploaded file is empty.")
-    return data
+# ── Pipeline ──────────────────────────────────────────────────────────────────
 
 def _run_pipeline(pdf_path: Path, filename: str, doc_id: str = "") -> dict:
+    """
+    Full pipeline: PDF → text (cached) → FY detection → AI extraction (cached).
+    Second call on same doc_id is instant — everything served from cache.
+    """
     pages = extract_all_text(pdf_path)
-    primary_fy, sec_fy = get_financial_year(pdf_path, pages)
-    logger.info(f"{filename}: FY={primary_fy} | {len(pages)} pages")
-    extraction = extract_cma_fields(pages=pages, source_file=filename, doc_id=doc_id)
-    return {"primary_fy": primary_fy, "secondary_fy": sec_fy, "extraction": extraction}
+    current_fy, previous_fy = get_financial_year(pdf_path, pages)
+    logger.info(f"{filename}: FY={current_fy} prev={previous_fy} pages={len(pages)}")
+
+    extraction = extract_cma_fields(
+        pages       = pages,
+        source_file = filename,
+        doc_id      = doc_id,
+        current_fy  = current_fy,
+        previous_fy = previous_fy,
+    )
+    return {
+        "current_fy":   current_fy,
+        "previous_fy":  previous_fy,
+        "extraction":   extraction,
+    }
 
 # ── Background extraction worker ──────────────────────────────────────────────
 
 def _extraction_worker(job_id: str, company_slug: str, company_name: str, documents: list):
-    """Runs in a thread. Processes each doc, updates job status, stores result."""
     total = len(documents)
     _job_update(job_id, status="running", total=total, progress=0)
 
@@ -99,63 +105,61 @@ def _extraction_worker(job_id: str, company_slug: str, company_name: str, docume
     for i, doc in enumerate(documents):
         doc_id   = doc["doc_id"]
         filename = doc["filename"]
-        _job_update(job_id,
-            progress=i,
-            message=f"Processing {i+1}/{total}: {filename}"
-        )
+        _job_update(job_id, progress=i,
+                    message=f"Processing {i+1}/{total}: {filename}")
 
         path = get_document_path(company_slug, doc_id)
         if path is None:
-            doc_results.append({
-                "doc_id": doc_id, "filename": filename,
-                "status": "error_file_missing",
-                "primary_fy": None, "secondary_fy": None, "extraction": None,
-            })
+            doc_results.append({"doc_id": doc_id, "filename": filename,
+                "status": "error_file_missing", "current_fy": None,
+                "previous_fy": None, "extraction": None})
             continue
 
         try:
             res = _run_pipeline(path, filename, doc_id=doc_id)
             doc_results.append({
-                "doc_id":       doc_id,
-                "filename":     filename,
-                "status":       "success",
-                "primary_fy":   res["primary_fy"],
-                "secondary_fy": res["secondary_fy"],
-                "extraction":   res["extraction"],
+                "doc_id":     doc_id,
+                "filename":   filename,
+                "status":     "success",
+                "current_fy":  res["current_fy"],
+                "previous_fy": res["previous_fy"],
+                "extraction":  res["extraction"],
             })
             logger.info(f"Job {job_id}: done {filename} ({i+1}/{total})")
         except Exception as exc:
             logger.exception(f"Job {job_id}: failed {filename}")
-            doc_results.append({
-                "doc_id": doc_id, "filename": filename,
-                "status": f"error: {exc}",
-                "primary_fy": None, "secondary_fy": None, "extraction": None,
-            })
+            doc_results.append({"doc_id": doc_id, "filename": filename,
+                "status": f"error: {exc}", "current_fy": None,
+                "previous_fy": None, "extraction": None})
 
-    # Merge and store result
     try:
-        merged = merge_documents(
-            company_slug=company_slug,
-            company_name=company_name,
-            doc_results=doc_results,
-        )
-        _job_update(job_id,
-            status="done",
-            progress=total,
-            message="Extraction complete",
-            result=merged,
-            finished_at=datetime.utcnow().isoformat(),
-        )
+        merged = merge_documents(company_slug, company_name, doc_results)
+        _job_update(job_id, status="done", progress=total,
+                    message="Extraction complete",
+                    result=merged,
+                    finished_at=datetime.utcnow().isoformat())
         logger.info(f"Job {job_id}: COMPLETE for {company_slug}")
     except Exception as exc:
         logger.exception(f"Job {job_id}: merge failed")
         _job_update(job_id, status="error", error=str(exc))
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _require_pdf(file: UploadFile):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(400, "Only PDF files accepted.")
+
+def _read_bytes(file: UploadFile) -> bytes:
+    data = file.file.read()
+    if not data:
+        raise HTTPException(400, "Empty file.")
+    return data
+
 # ── System ────────────────────────────────────────────────────────────────────
 
 @app.get("/health", tags=["System"])
 def health():
-    return {"status": "ok", "version": "6.0.0"}
+    return {"status": "ok", "version": "7.0.0"}
 
 @app.get("/fields", tags=["System"])
 def list_fields():
@@ -168,6 +172,10 @@ async def upload_document(
     company_name: str = Form(..., min_length=2, max_length=200),
     file: UploadFile = File(...),
 ):
+    """
+    Upload a PDF. On duplicate content (same SHA-256), returns 409.
+    Clears AI cache for doc_id if re-uploading same filename to force re-extraction.
+    """
     _require_pdf(file)
     data = _read_bytes(file)
     try:
@@ -177,6 +185,11 @@ async def upload_document(
     except Exception as e:
         logger.exception("Storage failed")
         raise HTTPException(500, str(e))
+
+    # Clear any stale AI cache for this doc so new upload triggers fresh extraction
+    clear_ai_cache(meta["doc_id"])
+    logger.info(f"Uploaded: {meta['company_slug']}/{meta['doc_id']} — {meta['filename']}")
+
     return JSONResponse(status_code=201, content={
         "message":      "Uploaded successfully.",
         "doc_id":       meta["doc_id"],
@@ -200,28 +213,54 @@ def get_company_documents(company_slug: str):
 
 @app.delete("/documents/{company_slug}/{doc_id}", tags=["Documents"])
 def remove_document(company_slug: str, doc_id: str):
+    """Delete document and its AI cache."""
     if not delete_document(company_slug, doc_id):
         raise HTTPException(404, f"Document '{doc_id}' not found.")
     clear_ai_cache(doc_id)
     return {"message": f"Document '{doc_id}' deleted."}
 
-# ── Cache ─────────────────────────────────────────────────────────────────────
+# ── Cache management ──────────────────────────────────────────────────────────
 
-@app.delete("/extract/cache/{doc_id}", tags=["Extraction"])
-def clear_cache(doc_id: str):
-    return {"cleared": clear_ai_cache(doc_id), "doc_id": doc_id}
+@app.delete("/cache/all", tags=["Cache"],
+            summary="Clear ALL caches (OCR + AI) — forces full re-extraction")
+def clear_all_caches():
+    """
+    Wipes every cached result. Use when:
+    - Extraction logic has been updated
+    - You want completely fresh results
+    - Something looks wrong in outputs
+    """
+    ai_count  = clear_all_ai_caches()
+    ocr_count = clear_all_ocr_caches()
+    return {
+        "message":       "All caches cleared.",
+        "ai_caches_cleared":  ai_count,
+        "ocr_caches_cleared": ocr_count,
+    }
 
-# ── ASYNC extraction (recommended for multiple/large docs) ────────────────────
+@app.delete("/cache/ai", tags=["Cache"],
+            summary="Clear only AI extraction caches (keeps OCR cache)")
+def clear_all_ai():
+    count = clear_all_ai_caches()
+    return {"message": "AI caches cleared.", "cleared": count}
+
+@app.delete("/cache/ai/{doc_id}", tags=["Cache"],
+            summary="Clear AI cache for one document")
+def clear_one_ai_cache(doc_id: str):
+    cleared = clear_ai_cache(doc_id)
+    return {"cleared": cleared, "doc_id": doc_id}
+
+# ── Async extraction (recommended) ───────────────────────────────────────────
 
 @app.post("/extract/trigger/{company_slug}", tags=["Extraction"],
-          summary="Trigger background extraction → returns job_id immediately")
+          summary="Trigger background extraction → returns job_id instantly")
 def trigger_extraction(company_slug: str):
     """
-    Starts extraction in background. Returns job_id instantly.
-    Poll GET /extract/status/{job_id} for progress.
-    Get result from GET /extract/result/{job_id} when done.
+    Starts extraction in a background thread. Returns job_id immediately.
+    Cached docs return instantly; only new/changed docs hit OpenAI.
 
-    If a job is already running for this company, returns existing job_id.
+    Poll: GET /extract/status/{job_id}
+    Get result: GET /extract/result/{job_id}
     """
     info = list_company_documents(company_slug)
     if info is None:
@@ -230,7 +269,7 @@ def trigger_extraction(company_slug: str):
     if not docs:
         raise HTTPException(404, f"No documents uploaded for '{company_slug}'.")
 
-    # Check if there's already a running/done job for this company
+    # Return existing running job if one exists
     with _jobs_lock:
         for jid, job in _jobs.items():
             if job.get("company_slug") == company_slug and job.get("status") in ("pending", "running"):
@@ -244,14 +283,13 @@ def trigger_extraction(company_slug: str):
         "status":       "pending",
         "progress":     0,
         "total":        len(docs),
-        "message":      "Starting extraction...",
+        "message":      "Starting...",
         "result":       None,
         "error":        None,
         "started_at":   datetime.utcnow().isoformat(),
         "finished_at":  None,
     })
 
-    # Launch background thread
     t = threading.Thread(
         target=_extraction_worker,
         args=(job_id, company_slug, info["display_name"], docs),
@@ -259,38 +297,28 @@ def trigger_extraction(company_slug: str):
     )
     t.start()
 
-    logger.info(f"Started extraction job {job_id} for {company_slug} ({len(docs)} docs)")
+    logger.info(f"Started job {job_id} for {company_slug} ({len(docs)} docs)")
     return {
-        "job_id":   job_id,
-        "status":   "pending",
-        "total":    len(docs),
-        "message":  f"Extraction started for {len(docs)} document(s). Poll /extract/status/{job_id}",
+        "job_id": job_id, "status": "pending", "total": len(docs),
+        "message": f"Started for {len(docs)} doc(s). Poll /extract/status/{job_id}",
     }
 
 
-@app.get("/extract/status/{job_id}", tags=["Extraction"],
-         summary="Poll extraction job progress")
+@app.get("/extract/status/{job_id}", tags=["Extraction"])
 def get_job_status(job_id: str):
-    """
-    Poll this every 5 seconds from frontend.
-    Returns: { job_id, status, progress, total, message, percent }
-    status: pending | running | done | error
-    """
+    """Poll every 5 seconds. status: pending | running | done | error"""
     job = _job_get(job_id)
     if job is None:
         raise HTTPException(404, f"Job '{job_id}' not found.")
-
     total   = job.get("total", 1) or 1
     prog    = job.get("progress", 0)
-    percent = round(prog / total * 100)
-
     return {
         "job_id":       job_id,
         "company_slug": job.get("company_slug"),
         "status":       job.get("status"),
         "progress":     prog,
         "total":        total,
-        "percent":      percent,
+        "percent":      round(prog / total * 100),
         "message":      job.get("message"),
         "started_at":   job.get("started_at"),
         "finished_at":  job.get("finished_at"),
@@ -298,83 +326,69 @@ def get_job_status(job_id: str):
     }
 
 
-@app.get("/extract/result/{job_id}", tags=["Extraction"],
-         summary="Get extraction result when job is done")
+@app.get("/extract/result/{job_id}", tags=["Extraction"])
 def get_job_result(job_id: str):
-    """
-    Returns the full merged CMA data once status = 'done'.
-    Returns 202 if still processing, 500 if error.
-    """
+    """Get full CMA result. Returns 202 if still running."""
     job = _job_get(job_id)
     if job is None:
         raise HTTPException(404, f"Job '{job_id}' not found.")
-
-    status = job.get("status")
-    if status == "error":
+    if job.get("status") == "error":
         raise HTTPException(500, f"Extraction failed: {job.get('error')}")
-    if status in ("pending", "running"):
+    if job.get("status") in ("pending", "running"):
+        total = job.get("total", 1) or 1
         return JSONResponse(status_code=202, content={
-            "message": "Still processing. Check /extract/status/" + job_id,
-            "status":  status,
-            "percent": round(job.get("progress", 0) / (job.get("total", 1) or 1) * 100),
+            "message": f"Still processing. Check /extract/status/{job_id}",
+            "status":  job.get("status"),
+            "percent": round(job.get("progress", 0) / total * 100),
         })
-
     return JSONResponse(content=job["result"])
 
 
-@app.get("/extract/jobs", tags=["Extraction"],
-         summary="List all extraction jobs")
+@app.get("/extract/jobs", tags=["Extraction"])
 def list_jobs():
     with _jobs_lock:
         return [
-            {
-                "job_id":       jid,
-                "company_slug": j.get("company_slug"),
-                "status":       j.get("status"),
-                "progress":     j.get("progress"),
-                "total":        j.get("total"),
-                "started_at":   j.get("started_at"),
-                "finished_at":  j.get("finished_at"),
-            }
+            {"job_id": jid, "company_slug": j.get("company_slug"),
+             "status": j.get("status"), "progress": j.get("progress"),
+             "total": j.get("total"), "started_at": j.get("started_at"),
+             "finished_at": j.get("finished_at")}
             for jid, j in _jobs.items()
         ]
 
-
-# ── SYNC extraction (works instantly if cached, otherwise may timeout) ─────────
+# ── Sync extraction (for cached results — instant) ────────────────────────────
 
 @app.get("/extract/stored/{company_slug}", tags=["Extraction"],
-         summary="Sync extract (use /extract/trigger instead for large datasets)")
-def extract_company_all_years(company_slug: str):
+         summary="Sync extract (instant if cached, may timeout on first run)")
+def extract_company_sync(company_slug: str):
     """
-    Synchronous extraction. Fine if all docs are already cached (fast).
-    For fresh extraction of many docs, use POST /extract/trigger/{company_slug} instead.
+    Synchronous. Use after jobs complete or when all docs are already cached.
+    For first-time extraction of many docs, use POST /extract/trigger instead.
     """
     info = list_company_documents(company_slug)
     if info is None:
         raise HTTPException(404, f"Company '{company_slug}' not found.")
     docs = info.get("documents", [])
     if not docs:
-        raise HTTPException(404, f"No documents uploaded for '{company_slug}'.")
+        raise HTTPException(404, f"No documents found for '{company_slug}'.")
 
     doc_results = []
     for doc in docs:
-        doc_id, filename = doc["doc_id"], doc["filename"]
-        path = get_document_path(company_slug, doc_id)
+        path = get_document_path(company_slug, doc["doc_id"])
         if path is None:
-            doc_results.append({"doc_id": doc_id, "filename": filename,
-                "status": "error_file_missing", "primary_fy": None,
-                "secondary_fy": None, "extraction": None})
+            doc_results.append({"doc_id": doc["doc_id"], "filename": doc["filename"],
+                "status": "error_file_missing", "current_fy": None,
+                "previous_fy": None, "extraction": None})
             continue
         try:
-            res = _run_pipeline(path, filename, doc_id=doc_id)
-            doc_results.append({"doc_id": doc_id, "filename": filename,
-                "status": "success", "primary_fy": res["primary_fy"],
-                "secondary_fy": res["secondary_fy"], "extraction": res["extraction"]})
+            res = _run_pipeline(path, doc["filename"], doc_id=doc["doc_id"])
+            doc_results.append({"doc_id": doc["doc_id"], "filename": doc["filename"],
+                "status": "success", "current_fy": res["current_fy"],
+                "previous_fy": res["previous_fy"], "extraction": res["extraction"]})
         except Exception as exc:
-            logger.exception(f"Failed: {filename}")
-            doc_results.append({"doc_id": doc_id, "filename": filename,
-                "status": f"error: {exc}", "primary_fy": None,
-                "secondary_fy": None, "extraction": None})
+            logger.exception(f"Failed: {doc['filename']}")
+            doc_results.append({"doc_id": doc["doc_id"], "filename": doc["filename"],
+                "status": f"error: {exc}", "current_fy": None,
+                "previous_fy": None, "extraction": None})
 
     return JSONResponse(content=merge_documents(
         company_slug=company_slug,
@@ -385,16 +399,17 @@ def extract_company_all_years(company_slug: str):
 
 @app.get("/extract/stored/{company_slug}/{doc_id}", tags=["Extraction"])
 def extract_single_doc(company_slug: str, doc_id: str):
+    """Extract one stored document. Returns from cache if available."""
     path = get_document_path(company_slug, doc_id)
     if path is None:
         raise HTTPException(404, f"Document '{doc_id}' not found.")
     try:
         res = _run_pipeline(path, path.name, doc_id=doc_id)
         return JSONResponse(content={
-            "primary_fy": res["primary_fy"],
-            "secondary_fy": res["secondary_fy"],
+            "current_fy":   res["current_fy"],
+            "previous_fy":  res["previous_fy"],
             **res["extraction"],
         })
     except Exception as exc:
-        logger.exception("Extraction failed")
+        logger.exception("Single doc extraction failed")
         raise HTTPException(500, str(exc))
