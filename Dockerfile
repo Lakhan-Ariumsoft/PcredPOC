@@ -23,8 +23,9 @@ RUN mkdir -p /data/uploads /data/temp
 # Tell the app where to store files (overrides the local default)
 ENV UPLOADS_ROOT=/data/uploads
 ENV TEMP_DIR=/data/temp
-ENV PORT=8000
-CMD uvicorn app.main:app --host 0.0.0.0 --port $PORT
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# ENV PORT=8000
+# CMD uvicorn app.main:app --host 0.0.0.0 --port $PORT
 
 # CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
 EXPOSE 8000
