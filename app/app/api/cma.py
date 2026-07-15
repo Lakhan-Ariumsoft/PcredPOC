@@ -258,6 +258,22 @@ async def upload_document(
     clear_ai_cache(meta["doc_id"])
     logger.info(f"Uploaded: {meta['company_slug']}/{meta['doc_id']} — {meta['filename']}")
 
+    # Heuristic pre-flight estimate for just this document, so cost is
+    # visible immediately on upload rather than requiring a separate call
+    # to GET /cma/estimate/{company_slug} before deciding whether to extract.
+    estimate = None
+    try:
+        import fitz
+        with fitz.open(meta["path"]) as pdf:
+            raw_pages = len(pdf)
+        sp = start_page or 1
+        ep = end_page or raw_pages
+        effective_pages = max(0, min(ep, raw_pages) - sp + 1)
+        settings = get_settings()
+        estimate = estimate_pipeline_cost([effective_pages], settings.docling_model, settings.extraction_model)
+    except Exception as e:
+        logger.warning(f"Cost estimate failed for {meta['doc_id']}: {e}")
+
     return JSONResponse(status_code=201, content={
         "message":      "Uploaded successfully.",
         "doc_id":       meta["doc_id"],
@@ -270,6 +286,7 @@ async def upload_document(
         "start_page":   meta["start_page"],
         "end_page":     meta["end_page"],
         "notes":        meta["notes"],
+        "extraction_estimate": estimate,
     })
 
 
