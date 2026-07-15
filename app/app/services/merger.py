@@ -51,6 +51,8 @@ def merge_documents(
     all_fys:  list[str] = []
     warnings: list[str] = []
     docs_out: list[dict] = []
+    unmapped_seen: set[str] = set()
+    unmapped_out:  list[dict] = []
 
     for doc in doc_results:
         doc_id     = doc["doc_id"]
@@ -79,6 +81,14 @@ def merge_documents(
 
         if current_fy  != "unknown": all_fys.append(current_fy)
         if previous_fy != "unknown": all_fys.append(previous_fy)
+
+        for item in extraction.get("unmapped_items", []):
+            label = (item.get("label") or "").strip()
+            key = label.lower()
+            if not label or key in unmapped_seen:
+                continue
+            unmapped_seen.add(key)
+            unmapped_out.append({**item, "source_filename": filename})
 
         for sk, section_data in extraction.get("sections", {}).items():
             if sk not in cma_data:
@@ -134,4 +144,5 @@ def merge_documents(
         "cma_data":        cma_data,
         "field_mode":      "full_199",
         "warnings":        warnings,
+        "unmapped_items":  unmapped_out,
     }

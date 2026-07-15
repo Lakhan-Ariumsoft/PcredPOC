@@ -341,6 +341,8 @@ class CMAWriter:
         self._ratio_analysis()
         self._blank()
         self._key_indicators()
+        self._append_unmapped_items()
+        self._remove_null_rows()
         # freeze top 3 rows
         self.ws.freeze_panes = self.ws.cell(row=3, column=C_FY23)
         # print settings
@@ -1890,6 +1892,69 @@ class CMAWriter:
             self._row("", lbl, rv, calc=(lbl in ratio_rows), nf=nf_)
 
     # ─────────────────────────────────────────────────────────────────────────
+    # POST-PROCESSING: drop rows with nothing extracted, append unmapped items
+    # ─────────────────────────────────────────────────────────────────────────
+    def _remove_null_rows(self):
+        """
+        Delete data rows where every year column (FY23/24/25 + both
+        projections) is empty — a row that found nothing adds no
+        information and just clutters the report. Section headers/titles
+        aren't touched: they live in merged cells anchored at column 1, so
+        ws.cell(row, C_LBL) reads back as None for them (MergedCell), which
+        this deliberately treats as "not a data row" rather than "empty
+        data row" — the two are structurally distinguishable in openpyxl,
+        not just by convention.
+        """
+        ws = self.ws
+        rows_to_delete = []
+        for r in range(1, ws.max_row + 1):
+            label_cell = ws.cell(row=r, column=C_LBL)
+            if label_cell.value is None:
+                continue  # section header / title / spacer row — keep
+            all_empty = all(
+                ws.cell(row=r, column=c).value in (None, "")
+                for c in ALL
+            )
+            if all_empty:
+                rows_to_delete.append(r)
+
+        for r in reversed(rows_to_delete):
+            ws.delete_rows(r, 1)
+
+    def _append_unmapped_items(self):
+        """
+        Line items the OCR table normalizer found in the source document(s)
+        that don't correspond to any of the 206 standard CMA fields — e.g. a
+        company-specific line item with no equivalent in the standard
+        template. Surfaced so nothing extracted is silently dropped, even
+        if it doesn't fit the standardized bank-report schema.
+        """
+        items = self.data.get("unmapped_items", [])
+        if not items:
+            return
+
+        self._blank(4)
+        self._sec("ADDITIONAL ITEMS FOUND (not part of standard CMA fields)", bg=BG_TITLE, size=10)
+        r = self.row
+        self.ws.row_dimensions[r].height = 16
+        self._c(r, C_SR, "", bold=True, bg=BG_SUBSECT)
+        self._c(r, C_LBL, "Label (as found in source)", bold=True, bg=BG_SUBSECT, color=FG_DARK)
+        self._c(r, C_VAR, "Page", bold=True, bg=BG_SUBSECT, align="center", color=FG_DARK)
+        self._c(r, C_FY23, "Current Value", bold=True, bg=BG_SUBSECT, align="center", color=FG_DARK)
+        self._c(r, C_FY24, "Previous Value", bold=True, bg=BG_SUBSECT, align="center", color=FG_DARK)
+        self._c(r, C_FY25, "Source File", bold=True, bg=BG_SUBSECT, align="center", color=FG_DARK)
+        self.row += 1
+
+        for item in items:
+            r = self.row
+            self.ws.row_dimensions[r].height = 16
+            self._c(r, C_LBL, item.get("label", ""), bg=BG_DATA)
+            self._c(r, C_VAR, item.get("page"), bg=BG_DATA, align="center")
+            self._c(r, C_FY23, item.get("current_value"), bg=BG_DATA, align="right", nf=NF_NUM)
+            self._c(r, C_FY24, item.get("previous_value"), bg=BG_DATA, align="right", nf=NF_NUM)
+            self._c(r, C_FY25, item.get("source_filename", ""), bg=BG_DATA)
+            self.row += 1
+
     def save(self, path):
         path = Path(path)
         self.wb.save(path)

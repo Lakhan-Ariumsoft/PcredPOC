@@ -13,7 +13,7 @@ import asyncio
 from pathlib import Path
 from typing import Optional
 
-from app.schemas.cma_fields import CMA_SECTIONS
+from app.schemas.cma_fields import CMA_SECTIONS, CMA_FIELDS_FLAT
 from app.services.client_factory import get_llm_adapter
 from app.utils.json_tools import parse_json_object
 logger = logging.getLogger(__name__)
@@ -83,6 +83,109 @@ def clear_ai_cache(doc_id: str) -> bool:
     except Exception:
         pass
     return False
+
+# ── Self-learning term store ────────────────────────────────────────────────
+# Fully automatic (no human review step — chosen explicitly): after every
+# extraction run, any field found with very high confidence has its evidence
+# label mined for a candidate synonym/keyword term. If new, it's persisted
+# to disk and merged into keyword routing + targeted search for every future
+# run — the system gets better at recognizing unfamiliar formats over time
+# without any model fine-tuning happening (every LLM call stays stateless;
+# this only grows the deterministic keyword/synonym dictionaries around it).
+#
+# Risk of full automation: one mislabeled high-confidence match can pollute
+# routing for every future extraction with no one catching it. Mitigated
+# (not eliminated) by requiring MIN_LEARN_CONFIDENCE and sane term-length
+# bounds before anything is learned.
+
+LEARNED_TERMS_VERSION = "v1"
+MIN_LEARN_CONFIDENCE = 0.95
+
+def _learned_terms_path() -> Path:
+    settings = get_settings_for_cache()
+    return settings.output_dir / "learned_terms.json"
+
+def load_learned_terms() -> dict:
+    """
+    Re-read from disk on every call (not cached at import) so learning from
+    one extraction is visible to the very next one within the same
+    long-running server process.
+    """
+    try:
+        p = _learned_terms_path()
+        if p.exists():
+            data = json.loads(p.read_text())
+            if data.get("_version") == LEARNED_TERMS_VERSION:
+                return data
+    except Exception as e:
+        logger.warning(f"Failed to load learned terms: {e}")
+    return {"_version": LEARNED_TERMS_VERSION, "field_terms": {}, "section_keywords": {}}
+
+def _save_learned_terms(data: dict) -> None:
+    try:
+        data["_version"] = LEARNED_TERMS_VERSION
+        _learned_terms_path().write_text(json.dumps(data, indent=2))
+    except Exception as e:
+        logger.warning(f"Failed to save learned terms: {e}")
+
+_EVIDENCE_LABEL_RE = re.compile(r"^\[page \d+\]\s*", re.IGNORECASE)
+
+def _extract_candidate_term(evidence: str) -> Optional[str]:
+    """
+    Pulls the textual label portion out of an evidence quote, e.g.
+    "Freight & Handling Income | 45,230.18 | 38,910.43" -> "freight & handling income".
+    Returns None if there's nothing usable (empty, too short/long, or
+    evidence that's just a bare number with no label).
+    """
+    if not evidence:
+        return None
+    text = _EVIDENCE_LABEL_RE.sub("", evidence.strip())
+    label = text.split("|")[0].strip(" -:\t").lower()
+    label = re.sub(r"\s+", " ", label)
+    if len(label) < 4 or len(label) > 80:
+        return None
+    if not re.search(r"[a-z]{3,}", label):
+        return None
+    return label
+
+def learn_from_extraction(sections_out: dict) -> None:
+    """
+    Scans a completed extraction's results for very-high-confidence fields
+    and grows the persistent learned-term store with any new label wording
+    found in their evidence. See module-level comment above for the
+    automatic-vs-reviewed tradeoff.
+    """
+    learned = load_learned_terms()
+    field_terms = learned.setdefault("field_terms", {})
+    section_kw = learned.setdefault("section_keywords", {})
+    changed = False
+
+    for section_key, section_data in sections_out.items():
+        for field_name, entry in section_data.get("fields", {}).items():
+            for year_key in ("current", "previous"):
+                y = entry.get(year_key, {}) if isinstance(entry, dict) else {}
+                conf = float(y.get("confidence") or 0)
+                if conf < MIN_LEARN_CONFIDENCE:
+                    continue
+                term = _extract_candidate_term(y.get("evidence", ""))
+                if not term or term == field_name.lower():
+                    continue
+
+                existing = {t.lower() for t in FIELD_SEARCH_TERMS.get(field_name, [])}
+                existing |= {t.lower() for t in field_terms.get(field_name, [])}
+                if term in existing:
+                    continue
+
+                field_terms.setdefault(field_name, []).append(term)
+                bucket = section_kw.setdefault(section_key, [])
+                if term not in [t.lower() for t in bucket]:
+                    bucket.append(term)
+                changed = True
+                logger.info(f"Learned new term for '{field_name}' ({section_key}): '{term}'")
+
+    if changed:
+        _save_learned_terms(learned)
+
 
 def clear_all_ai_caches() -> int:
     count = 0
@@ -391,9 +494,13 @@ SECTION_KEYWORDS: dict[str, list[str]] = {
     ],
 }
 
-def _chunk_relevance(chunk: str, section_key: str, entity_type: str = DEFAULT_ENTITY_TYPE) -> int:
+def _chunk_relevance(
+    chunk: str, section_key: str, entity_type: str = DEFAULT_ENTITY_TYPE,
+    learned: Optional[dict] = None,
+) -> int:
     keywords = list(SECTION_KEYWORDS.get(section_key, []))
     keywords += ENTITY_TYPE_EXTRA_KEYWORDS.get(entity_type, {}).get(section_key, [])
+    keywords += (learned or {}).get("section_keywords", {}).get(section_key, [])
     t = chunk.lower()
     return min(100, sum(8 for kw in keywords if kw in t))
 
@@ -412,14 +519,17 @@ def _spread_fallback_indices(total_chunks: int, k: int) -> set[int]:
     step = total_chunks / k
     return {int(i * step) for i in range(k)}
 
-def _get_relevant_chunks(chunks: list[str], section_key: str, entity_type: str = DEFAULT_ENTITY_TYPE, top_k: int = 4) -> list[str]:
+def _get_relevant_chunks(
+    chunks: list[str], section_key: str, entity_type: str = DEFAULT_ENTITY_TYPE, top_k: int = 4,
+    learned: Optional[dict] = None,
+) -> list[str]:
     """
     Return the top-k most relevant chunks for a section (default 4 to increase recall).
     """
     if len(chunks) <= top_k:
         return chunks
 
-    scored = [(i, _chunk_relevance(c, section_key, entity_type)) for i, c in enumerate(chunks)]
+    scored = [(i, _chunk_relevance(c, section_key, entity_type, learned)) for i, c in enumerate(chunks)]
     scored.sort(key=lambda x: -x[1])
 
     top_indices = {i for i, score in scored[:top_k] if score > 0}
@@ -1054,16 +1164,21 @@ FIELD_SEARCH_TERMS: dict[str, list[str]] = {
     "Administrative Expenses": ["administrative expenses", "general and admin", "general & administration"],
 }
 
-def _find_field_snippets(pages: list[dict], fields: list[str], entity_type: str = DEFAULT_ENTITY_TYPE) -> dict[str, str]:
+def _find_field_snippets(
+    pages: list[dict], fields: list[str], entity_type: str = DEFAULT_ENTITY_TYPE,
+    learned: Optional[dict] = None,
+) -> dict[str, str]:
     results: dict[str, str] = {}
     full_pages = sorted(pages, key=lambda p: p["page"])
     entity_terms = ENTITY_TYPE_EXTRA_SEARCH_TERMS.get(entity_type, {})
+    learned_terms = (learned or {}).get("field_terms", {})
 
     for field in fields:
         search_terms = (
             [field.lower()]
             + [t.lower() for t in FIELD_SEARCH_TERMS.get(field, [])]
             + [t.lower() for t in entity_terms.get(field, [])]
+            + [t.lower() for t in learned_terms.get(field, [])]
         )
         matches = []
 
@@ -1118,6 +1233,7 @@ async def _run_second_pass(
     unit:          str,
     entity_type:   str = DEFAULT_ENTITY_TYPE,
     notes:         str = "",
+    learned:       Optional[dict] = None,
 ) -> dict:
     if os.environ.get("OPENAI_API_KEY", "").lower() == "mock":
         return sections_out
@@ -1139,7 +1255,7 @@ async def _run_second_pass(
 
         logger.info(f"Second pass: {label} — {len(null_fields)} null fields")
 
-        snippets = _find_field_snippets(pages, null_fields, entity_type)
+        snippets = _find_field_snippets(pages, null_fields, entity_type, learned)
         if not snippets:
             logger.info(f"  → no snippets found for any null field in {label}")
             continue
@@ -1201,6 +1317,176 @@ async def _run_second_pass(
     return sections_out
 
 
+# ── Pre-flight cost/token estimation ────────────────────────────────────────────
+# Heuristic, not measured: OpenAI doesn't expose a dry-run token counter for
+# this pipeline's actual prompts (each includes variable-length OCR'd chunk
+# text, candidate hints, and synonym lists), so these are reasoned averages,
+# not exact figures. Purpose is to give a ballpark before spending real money
+# on a multi-document company, not a precise invoice.
+
+# USD per 1M tokens. Update if OpenAI repricing changes these.
+MODEL_PRICING_PER_1M_TOKENS: dict[str, dict[str, float]] = {
+    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
+    "gpt-4o":      {"input": 2.50, "output": 10.00},
+}
+
+# Per OCR'd page: a rendered page image at "auto" detail (this pipeline sets
+# no explicit detail level) plus a short instruction prompt, and typical
+# markdown-table output length for a dense financial-statement page.
+OCR_INPUT_TOKENS_PER_PAGE  = 1700
+OCR_OUTPUT_TOKENS_PER_PAGE = 900
+
+# Per document: extraction makes one full pass over all 18 CMA sections
+# regardless of page count (bounded by field/section count, not page count) —
+# ~18 sections x ~3 relevant chunks x ~3 field-batches, plus a second pass
+# for null fields. Observed range across real runs this session: 150-200
+# calls/document; this uses the midpoint.
+EXTRACTION_CALLS_PER_DOCUMENT_ESTIMATE  = 190
+EXTRACTION_INPUT_TOKENS_PER_CALL  = 1800
+EXTRACTION_OUTPUT_TOKENS_PER_CALL = 350
+
+
+def _model_cost(model: str, input_tokens: int, output_tokens: int) -> Optional[float]:
+    pricing = MODEL_PRICING_PER_1M_TOKENS.get(model)
+    if not pricing:
+        return None
+    return round(
+        input_tokens / 1_000_000 * pricing["input"] + output_tokens / 1_000_000 * pricing["output"],
+        4,
+    )
+
+
+def estimate_pipeline_cost(
+    doc_page_counts: list[int],
+    docling_model: str,
+    extraction_model: str,
+) -> dict:
+    """
+    Estimate OCR + extraction token usage and USD cost for a set of
+    documents (one page count per document, after any start_page/end_page
+    trimming has already been applied by the caller).
+    """
+    total_pages = sum(doc_page_counts)
+    num_docs = len(doc_page_counts)
+
+    ocr_input_tokens  = total_pages * OCR_INPUT_TOKENS_PER_PAGE
+    ocr_output_tokens = total_pages * OCR_OUTPUT_TOKENS_PER_PAGE
+
+    total_extraction_calls   = num_docs * EXTRACTION_CALLS_PER_DOCUMENT_ESTIMATE
+    extraction_input_tokens  = total_extraction_calls * EXTRACTION_INPUT_TOKENS_PER_CALL
+    extraction_output_tokens = total_extraction_calls * EXTRACTION_OUTPUT_TOKENS_PER_CALL
+
+    ocr_cost        = _model_cost(docling_model, ocr_input_tokens, ocr_output_tokens)
+    extraction_cost = _model_cost(extraction_model, extraction_input_tokens, extraction_output_tokens)
+    total_cost = (
+        round(ocr_cost + extraction_cost, 4)
+        if ocr_cost is not None and extraction_cost is not None
+        else None
+    )
+
+    return {
+        "documents": num_docs,
+        "total_pages": total_pages,
+        "estimated_ocr_calls": total_pages,
+        "estimated_extraction_calls": total_extraction_calls,
+        "estimated_tokens": {
+            "ocr_input": ocr_input_tokens,
+            "ocr_output": ocr_output_tokens,
+            "extraction_input": extraction_input_tokens,
+            "extraction_output": extraction_output_tokens,
+            "total": ocr_input_tokens + ocr_output_tokens + extraction_input_tokens + extraction_output_tokens,
+        },
+        "estimated_cost_usd": {
+            "ocr": ocr_cost,
+            "extraction": extraction_cost,
+            "total": total_cost,
+        },
+        "pricing_available_for": {
+            "docling_model": docling_model in MODEL_PRICING_PER_1M_TOKENS,
+            "extraction_model": extraction_model in MODEL_PRICING_PER_1M_TOKENS,
+        },
+        "note": (
+            "Heuristic estimate based on typical page/call sizes observed in this "
+            "pipeline, not a measured token count — actual usage varies with "
+            "document density and how many fields need second-pass recovery. "
+            "$ cost only available for models with known OpenAI pricing above; "
+            "self-hosted/HF-hosted models show token estimates only."
+        ),
+    }
+
+
+# ── Unmapped line items ──────────────────────────────────────────────────────
+# The rule-based OCR table normalizer (ocr_normalizer.normalize_ocr_output)
+# already scans every table row in the document to build "candidate_hints"
+# for the 206 known CMA fields — it finds every labeled row regardless of
+# whether that label maps to anything we track. Reusing that (already-free,
+# no extra LLM calls) list to surface whatever DOESN'T map to a known field
+# means nothing the document actually contains gets silently dropped just
+# because it isn't part of the standardized CMA schema.
+
+def _all_known_field_terms(learned: Optional[dict] = None) -> set[str]:
+    terms: set[str] = set()
+    for field_name in CMA_FIELDS_FLAT:
+        terms.add(field_name.lower())
+        terms.update(t.lower() for t in FIELD_SEARCH_TERMS.get(field_name, []))
+    for entity_terms in ENTITY_TYPE_EXTRA_SEARCH_TERMS.values():
+        for extra in entity_terms.values():
+            terms.update(t.lower() for t in extra)
+    if learned:
+        for field_terms in learned.get("field_terms", {}).values():
+            terms.update(t.lower() for t in field_terms)
+    return terms
+
+
+def _is_mapped_label(label: str, known_terms: set[str]) -> bool:
+    """
+    Heuristic substring match, not exact — a candidate label is considered
+    "already covered" if it shares a reasonably long fragment with any known
+    field/alias. Terms under 4 chars are skipped to avoid short-token false
+    positives (e.g. "pat" matching inside "Repatriation"); the cost of that
+    is a few borderline duplicates surfacing in the unmapped list rather
+    than a real line item getting silently suppressed, which is the
+    direction we want to err in for an additive, non-authoritative section.
+    """
+    label_lower = (label or "").strip().lower()
+    if not label_lower:
+        return True
+    for term in known_terms:
+        if len(term) < 4:
+            continue
+        if term in label_lower or label_lower in term:
+            return True
+    return False
+
+
+def find_unmapped_candidates(candidates: list[dict], learned: Optional[dict] = None) -> list[dict]:
+    """
+    Candidates the table normalizer found that don't match any of the 206
+    standard CMA fields (by name, search alias, entity-type override, or
+    self-learned term). Deduplicated by label.
+    """
+    known_terms = _all_known_field_terms(learned)
+    seen: set[str] = set()
+    unmapped: list[dict] = []
+    for c in candidates:
+        label = (c.get("label") or "").strip()
+        if not label or _is_mapped_label(label, known_terms):
+            continue
+        if c.get("current_year_value") is None and c.get("previous_year_value") is None:
+            continue
+        key = label.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unmapped.append({
+            "label":           label,
+            "page":            c.get("page_number"),
+            "current_value":   c.get("current_year_value"),
+            "previous_value":  c.get("previous_year_value"),
+        })
+    return unmapped
+
+
 # ── Public extraction API ──────────────────────────────────────────────────────
 
 async def extract_cma_fields(
@@ -1231,6 +1517,7 @@ async def extract_cma_fields(
         return cached
 
     pages = trim_pages(pages, start_page, end_page)
+    learned = load_learned_terms()
 
     unit = detect_unit(pages)
     logger.info(
@@ -1261,7 +1548,7 @@ async def extract_cma_fields(
         fields_count = len(meta["fields"])
         logger.info(f"Extracting: {meta['label']} ({fields_count} fields)")
 
-        relevant_chunks = _get_relevant_chunks(chunks, section_key, entity_type, top_k=3)
+        relevant_chunks = _get_relevant_chunks(chunks, section_key, entity_type, top_k=3, learned=learned)
         logger.info(f"  → {len(relevant_chunks)} relevant chunks (of {len(chunks)} total)")
 
         chunk_results = []
@@ -1294,7 +1581,7 @@ async def extract_cma_fields(
         logger.info(f"  → {found}/{fields_count} fields found")
 
     logger.info(f"{source_file}: running second pass for null fields...")
-    sections_out = await _run_second_pass(sections_out, pages, current_fy, previous_fy, unit, entity_type, notes)
+    sections_out = await _run_second_pass(sections_out, pages, current_fy, previous_fy, unit, entity_type, notes, learned)
 
     fields_lookup: dict = {
         sk: {fn: sv["fields"][fn] for fn in sv["fields"]}
@@ -1315,6 +1602,8 @@ async def extract_cma_fields(
         or fv.get("previous", {}).get("value") is not None
     )
 
+    unmapped_items = find_unmapped_candidates(candidates, learned)
+
     result = {
         "meta": {
             "source_file":      source_file,
@@ -1334,8 +1623,15 @@ async def extract_cma_fields(
             "total_pages":      len(pages),
         },
         "sections": sections_out,
+        "unmapped_items": unmapped_items,
     }
 
     _save_ai_cache(cache_key, result, fingerprint)
+
+    try:
+        learn_from_extraction(sections_out)
+    except Exception as e:
+        logger.warning(f"Self-learning step failed (non-fatal): {e}")
+
     logger.info(f"{source_file}: extraction complete — {found_after}/{total_fields} fields ({result['meta']['coverage_pct']}%)")
     return result

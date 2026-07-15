@@ -46,3 +46,107 @@ def test_generate_cma_excel():
     # Check that title cell contains Acme Corp
     title_val = ws.cell(row=1, column=1).value
     assert "Acme Corp" in title_val
+
+
+def _value_columns():
+    from app.services.cma_reporter_service import ALL
+    return ALL
+
+
+def test_generate_cma_excel_removes_fully_null_rows():
+    mock_data = {
+        "company_name": "Sparse Corp",
+        "company_slug": "sparse-corp",
+        "financial_years": ["2022-23", "2023-24", "2024-25"],
+        "cma_data": {
+            "sales": {
+                "label": "Sales",
+                "fields": {
+                    "Net Sales": {
+                        "2022-23": {"value": 1000.0, "confidence": 0.9},
+                        "2023-24": {"value": 1100.0, "confidence": 0.95},
+                        "2024-25": {"value": 1200.0, "confidence": 0.95},
+                    }
+                },
+            },
+        },
+    }
+    excel_bytes = generate_cma_excel(mock_data)
+    wb = load_workbook(io.BytesIO(excel_bytes))
+    ws = wb["CMA"]
+
+    value_cols = _value_columns()
+    for r in range(1, ws.max_row + 1):
+        label = ws.cell(row=r, column=3).value
+        if label is None:
+            continue  # section header / merged row — not a data row
+        values = [ws.cell(row=r, column=c).value for c in value_cols]
+        assert not all(v in (None, "") for v in values), (
+            f"row {r} ('{label}') should have been removed — all value columns empty"
+        )
+
+
+def test_generate_cma_excel_keeps_populated_rows():
+    mock_data = {
+        "company_name": "Sparse Corp",
+        "company_slug": "sparse-corp",
+        "financial_years": ["2022-23", "2023-24", "2024-25"],
+        "cma_data": {
+            "sales": {
+                "label": "Sales",
+                "fields": {
+                    "Net Sales": {
+                        "2022-23": {"value": 1000.0, "confidence": 0.9},
+                        "2023-24": {"value": 1100.0, "confidence": 0.95},
+                        "2024-25": {"value": 1200.0, "confidence": 0.95},
+                    }
+                },
+            },
+        },
+    }
+    excel_bytes = generate_cma_excel(mock_data)
+    wb = load_workbook(io.BytesIO(excel_bytes))
+    ws = wb["CMA"]
+
+    labels = [ws.cell(row=r, column=3).value for r in range(1, ws.max_row + 1)]
+    assert any(lbl and "Domestic Sale" in str(lbl) for lbl in labels)
+
+
+def test_generate_cma_excel_appends_unmapped_items():
+    mock_data = {
+        "company_name": "Acme Corp",
+        "company_slug": "acme-corp",
+        "financial_years": ["2022-23"],
+        "cma_data": {},
+        "unmapped_items": [
+            {
+                "label": "Some Custom Line Item",
+                "page": 7,
+                "current_value": 123.45,
+                "previous_value": 99.0,
+                "source_filename": "test.pdf",
+            }
+        ],
+    }
+    excel_bytes = generate_cma_excel(mock_data)
+    wb = load_workbook(io.BytesIO(excel_bytes))
+    ws = wb["CMA"]
+
+    labels = [ws.cell(row=r, column=3).value for r in range(1, ws.max_row + 1)]
+    assert any(lbl and "Some Custom Line Item" in str(lbl) for lbl in labels)
+
+
+def test_generate_cma_excel_no_unmapped_items_adds_nothing():
+    mock_data = {
+        "company_name": "Acme Corp",
+        "company_slug": "acme-corp",
+        "financial_years": ["2022-23"],
+        "cma_data": {},
+        "unmapped_items": [],
+    }
+    # Should not raise, and should not add an "ADDITIONAL ITEMS" section.
+    excel_bytes = generate_cma_excel(mock_data)
+    wb = load_workbook(io.BytesIO(excel_bytes))
+    ws = wb["CMA"]
+    values = [ws.cell(row=r, column=1).value for r in range(1, ws.max_row + 1)]
+    assert not any(v and "ADDITIONAL ITEMS" in str(v) for v in values)

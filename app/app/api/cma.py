@@ -19,7 +19,10 @@ from app.services.merger import merge_documents
 from app.services.cma_validator import validate_extraction
 from app.services.cma_reporter_service import generate_cma_excel
 from app.services.docling_service import DoclingService
-from app.services.cma_extraction_service import extract_cma_fields, clear_ai_cache, clear_all_ai_caches
+from app.services.cma_extraction_service import (
+    extract_cma_fields, clear_ai_cache, clear_all_ai_caches, estimate_pipeline_cost,
+)
+from app.core_config import get_settings
 from app.utils.fy_detector import get_financial_year
 
 logger = logging.getLogger(__name__)
@@ -154,6 +157,61 @@ def list_fields():
         "field_mode": "full_199",
         "total_fields": len(CMA_FIELDS_FLAT),
         "sections": {k: {"label": v["label"], "fields": v["fields"]} for k, v in CMA_SECTIONS.items()},
+    }
+
+
+@router.get("/cma/estimate/{company_slug}")
+def estimate_extraction_cost(company_slug: str):
+    """
+    Estimate token usage and USD cost for extracting this company's
+    documents BEFORE running it — a heuristic ballpark (see
+    estimate_pipeline_cost's note field), not a measured quote.
+    Honors each document's stored start_page/end_page so the estimate
+    reflects what would actually be OCR'd/extracted, not the raw PDF length.
+    """
+    info = list_company_documents(company_slug)
+    if info is None:
+        raise HTTPException(404, f"Company '{company_slug}' not found.")
+    docs = info.get("documents", [])
+    if not docs:
+        raise HTTPException(404, f"No documents uploaded for '{company_slug}'.")
+
+    import fitz
+
+    per_doc = []
+    page_counts = []
+    for doc in docs:
+        path = get_document_path(company_slug, doc["doc_id"])
+        if path is None:
+            continue
+        try:
+            with fitz.open(path) as pdf:
+                raw_pages = len(pdf)
+        except Exception:
+            raw_pages = 1
+
+        meta = get_document_meta(company_slug, doc["doc_id"]) or {}
+        sp = meta.get("start_page") or 1
+        ep = meta.get("end_page") or raw_pages
+        effective_pages = max(0, min(ep, raw_pages) - sp + 1)
+
+        page_counts.append(effective_pages)
+        per_doc.append({
+            "filename": doc["filename"],
+            "raw_pages": raw_pages,
+            "pages_to_process": effective_pages,
+            "entity_type": meta.get("entity_type"),
+        })
+
+    settings = get_settings()
+    estimate = estimate_pipeline_cost(page_counts, settings.docling_model, settings.extraction_model)
+
+    return {
+        "company_slug": company_slug,
+        "docling_model": settings.docling_model,
+        "extraction_model": settings.extraction_model,
+        "documents": per_doc,
+        **estimate,
     }
 
 
