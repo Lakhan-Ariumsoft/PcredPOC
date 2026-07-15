@@ -53,6 +53,52 @@ def _value_columns():
     return ALL
 
 
+def test_generate_cma_excel_never_injects_hardcoded_template_numbers():
+    """
+    Regression guard: cma_reporter_service used to hardcode a batch of
+    Cargosol-Logistics-specific figures (Share Capital projection 1020.0,
+    Gross Block projection 3336.38, "Others"/"Share Premium" fixed at
+    388.6 for every single year including audited ones, etc.) as fallback
+    values applied to every company's report regardless of that company's
+    real data. A company with none of these fields extracted must not see
+    any of those numbers appear anywhere in its generated report.
+    """
+    mock_data = {
+        "company_name": "No Extra Data Ltd",
+        "company_slug": "no-extra-data-ltd",
+        "financial_years": ["2022-23", "2023-24", "2024-25"],
+        "cma_data": {
+            "sales": {
+                "label": "Sales",
+                "fields": {
+                    "Net Sales": {
+                        "2022-23": {"value": 1000.0, "confidence": 0.9},
+                        "2023-24": {"value": 1100.0, "confidence": 0.95},
+                        "2024-25": {"value": 1200.0, "confidence": 0.95},
+                    }
+                },
+            },
+        },
+    }
+    excel_bytes = generate_cma_excel(mock_data)
+    wb = load_workbook(io.BytesIO(excel_bytes))
+    ws = wb["CMA"]
+
+    formerly_hardcoded_values = {
+        256.5, 2350.0, 500, 169.23, 166.23, 3.0, 1020.0, 388.6,
+        42.56, 400, 50.0, 11.0, 3336.38, 48.09, 29.65, 50.88, 53.0,
+    }
+    seen_values = set()
+    for r in range(1, ws.max_row + 1):
+        for c in _value_columns():
+            v = ws.cell(row=r, column=c).value
+            if isinstance(v, (int, float)):
+                seen_values.add(v)
+
+    leaked = formerly_hardcoded_values & seen_values
+    assert not leaked, f"Hardcoded template values leaked into output: {leaked}"
+
+
 def test_generate_cma_excel_removes_fully_null_rows():
     mock_data = {
         "company_name": "Sparse Corp",

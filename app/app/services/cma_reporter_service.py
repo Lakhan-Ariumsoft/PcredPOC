@@ -541,7 +541,6 @@ class CMAWriter:
 
         # Interest
         cc_v = self._v("interest","Interest on CC")
-        cc_v[C_P26] = cc_v[C_P27] = 256.5   # from projection template
         self._row("","a. Interest on CC.", cc_v, nf=NF_NUM, indent=2)
         cc_r = self._rrow("a. Interest on CC.")
 
@@ -593,7 +592,6 @@ class CMAWriter:
                 bg=BG_SUBSECT, color=FG_DARK); self.row+=1
 
         noi_a_v = self._v("pnl","Interest/Dividend/Royalties")
-        noi_a_v[C_P26] = noi_a_v[C_P27] = 50.0
         self._row("a","Interest/Dividend/Royalties etc..", noi_a_v, nf=NF_NUM, indent=2)
         noi_a_r = self._rrow("Interest/Dividend/Royalties etc..")
 
@@ -617,7 +615,6 @@ class CMAWriter:
 
         # Non-op expenses (deductions)
         proc_fees = {c:None for c in ALL}
-        proc_fees[C_P26] = proc_fees[C_P27] = 53.0
         self._row("d","Processing fees", proc_fees, nf=NF_NUM, indent=2)
         pf_r = self._rrow("Processing fees")
 
@@ -727,8 +724,6 @@ class CMAWriter:
             else:
                 co = self._cell(cos_r,c); ti_ = self._cell(ti_r,c)
                 rm[c] = round(co/ti_,6) if co and ti_ and ti_!=0 else None
-        # projections: use RM% of ~85%
-        rm[C_P26] = 0.85; rm[C_P27] = 0.85
         self._row(32,"RM Content in sales", rm, calc=True, nf=NF_PCT)
 
         # PBDIT
@@ -789,7 +784,6 @@ class CMAWriter:
 
         # Sub Total A
         cc_v = self._v("current_liabilities","Short Term loans from Applicant Bank")
-        cc_v[C_P26]=cc_v[C_P27]=2350.0
         self._row("1.a","Short Term loans from Applicant Bank  ", cc_v, nf=NF_NUM)
         cc_r = self._rrow("Short Term loans from Applicant Bank  ")
 
@@ -798,7 +792,7 @@ class CMAWriter:
         self._row("1.b","Short Term loans From Other banks ", ob_v, nf=NF_NUM)
         ob_r = self._rrow("Short Term loans From Other banks ")
 
-        od_v = {c:None for c in ALL}; od_v[C_P26]=500; od_v[C_P27]=500
+        od_v = {c:None for c in ALL}
         self._row("1.c","Clean OD", od_v, nf=NF_NUM)
         od_r = self._rrow("Clean OD")
 
@@ -926,15 +920,12 @@ class CMAWriter:
         for c in ALL:
             ev = other_tl_ext.get(c)
             if ev is not None: other_tl[c] = ev
-        other_tl[C_P26]=other_tl[C_P27]=169.23
         self._row(17,"Other term Liabilities", other_tl, nf=NF_NUM)
         oth_tl_r = self._rrow("Other term Liabilities")
 
         ul_v = self._v("term_liabilities","Loan from Directors")
-        ul_v[C_P26]=ul_v[C_P27]=166.23
         self._row("a","Unsecured Loans from Directors", ul_v, nf=NF_NUM, indent=2)
         sec_dep = self._v("term_liabilities","Security Deposits")
-        sec_dep[C_P26]=sec_dep[C_P27]=3.0
         self._row("b","Security Deposits", sec_dep, nf=NF_NUM, indent=2)
         unsl = self._v("term_liabilities","Unsecured Loans")
         unsl[C_P26]=unsl[C_P27]=None
@@ -977,7 +968,6 @@ class CMAWriter:
         self._c(self.row,C_LBL,"NET WORTH",bold=True,bg=BG_SUBSECT,color=FG_DARK); self.row+=1
 
         sc_v = self._v("net_worth","Capital")
-        sc_v[C_P26]=sc_v[C_P27]=1020.0
         self._row(20,"Share Capital", sc_v, nf=NF_NUM)
         sc_r = self._rrow("Share Capital")
 
@@ -994,9 +984,9 @@ class CMAWriter:
         self._row(23,"Adjustments for previous Year costs",{c:None for c in ALL},nf=NF_NUM)
         self._row(24,"Other reserves (excluding Provisions)",{c:None for c in ALL},nf=NF_NUM)
 
-        others_v = {c:388.6 for c in ALL}
+        others_v = {c:None for c in ALL}
         self._row(25,"Others", others_v, nf=NF_NUM)
-        self._row("b","Share Premium", {c:388.6 for c in ALL}, nf=NF_NUM, indent=2)
+        self._row("b","Share Premium", self._v("net_worth","Share Premium"), nf=NF_NUM, indent=2)
 
         surp_v = {}
         for c in ALL:
@@ -1048,7 +1038,6 @@ class CMAWriter:
         self._row(2,"Govt. & other Trustee securities",{c:None for c in ALL},nf=NF_NUM)
 
         fd_v = self._v("current_assets","Fixed Deposits with Banks")
-        fd_v[C_P26]=fd_v[C_P27]=42.56
         self._row(3,"Fixed Deposits with Banks", fd_v, nf=NF_NUM)
 
         dr_v = self._v("current_assets","Domestic Receivables")
@@ -1058,7 +1047,7 @@ class CMAWriter:
         self._row("4.a","Domestic Receivables including BP/BD", dr_v, nf=NF_NUM)
         dr_r = self._rrow("Domestic Receivables including BP/BD")
 
-        ubr_v = {c:None for c in ALL}; ubr_v[C_P26]=400; ubr_v[C_P27]=400
+        ubr_v = {c:None for c in ALL}
         self._row("4.b","Unbilled receivables", ubr_v, nf=NF_NUM)
         self._row(5,"Export Receivables including BP/BD)",{c:None for c in ALL},nf=NF_NUM)
         dfr_v = self._v("current_assets","Deferred Receivables")
@@ -1087,10 +1076,8 @@ class CMAWriter:
         self._row(15,"Other Current Assets (specify major items)", oca_v, nf=NF_NUM)
 
         pre_v = self._v("current_assets","Prepaid Expenses")
-        pre_v[C_P26]=pre_v[C_P27]=50.0
         self._row("b","Prepaid expenses", pre_v, nf=NF_NUM, indent=2)
         dep_emd = self._v("current_assets","Deposits EMD")
-        dep_emd[C_P26]=dep_emd[C_P27]=11.0
         self._row("c","Deposits-EMD & Fixed Deposits", dep_emd, nf=NF_NUM, indent=2)
 
         # Total CA
@@ -1118,7 +1105,6 @@ class CMAWriter:
         self._c(self.row,C_LBL,"FIXED ASSETS",bold=True,bg=BG_SUBSECT,color=FG_DARK); self.row+=1
 
         gb_v = self._v("fixed_assets","Gross Block")
-        gb_v[C_P26]=gb_v[C_P27]=3336.38
         self._row(17,"Gross Block (Land & Building Machinery", gb_v, nf=NF_NUM)
         gb_r = self._rrow("Gross Block (Land & Building Machinery")
 
@@ -1157,7 +1143,6 @@ class CMAWriter:
         self.row+=1
 
         inv_v = self._v("non_current_assets","Non Current Investments")
-        inv_v[C_P26]=inv_v[C_P27]=48.09
         self._row("b","Investment in Others", inv_v, nf=NF_NUM, indent=2)
 
         dfrd_v = self._v("non_current_assets","Deferred Receivables")
@@ -1169,7 +1154,6 @@ class CMAWriter:
         self._row("d","Deferred Receivables(Maturng after a year)", dfrd_v, nf=NF_NUM, indent=2)
 
         sec_v = self._v("non_current_assets","Security Deposits")
-        sec_v[C_P26]=sec_v[C_P27]=29.65
         self._row("e","Security Deposits ", sec_v, nf=NF_NUM, indent=2)
 
         dta_v = self._v("non_current_assets","Deferred Tax Asset")
@@ -1187,7 +1171,6 @@ class CMAWriter:
         self._row("i","Advance Tax/TDS", atds_v, nf=NF_NUM, indent=2)
 
         fdl_v = self._v("non_current_assets","Long Term Fixed Deposits")
-        fdl_v[C_P26]=fdl_v[C_P27]=50.88
         self._row("j","Fixed Deposits (More Than One Year)", fdl_v, nf=NF_NUM, indent=2)
 
         onca = {}
@@ -1355,8 +1338,6 @@ class CMAWriter:
             else:
                 dr = self._cell(self._dr_r,c); s = self._cell(self._tgs_r,c)
                 dr_days[c] = round(dr/s*365) if dr and s and s!=0 else None
-        # project 73 days
-        dr_days[C_P26]=73; dr_days[C_P27]=73
         self._row("","Domestic receivables (Days Gross dom.Sales)",
                   dr_days, calc=True, nf=NF_INT)
 
@@ -1383,7 +1364,6 @@ class CMAWriter:
         for c in ALL:
             cr = self._cell(self._cred_r,c); co = self._cell(self._cos_r,c)
             cred_days[c] = round(cr/co*365) if cr and co and co!=0 else None
-        cred_days[C_P26]=22; cred_days[C_P27]=22
         self._row("","Creditors - (days Consumption)", cred_days, calc=True, nf=NF_INT)
 
         self._row("","Total Current Assets",
