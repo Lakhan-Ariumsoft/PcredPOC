@@ -71,10 +71,17 @@ def test_upload_rejects_non_pdf_file():
 
 
 def _real_pdf_bytes(num_pages: int = 3) -> bytes:
+    """
+    A real, openable, non-blank PDF — text content is required, not just a
+    valid PDF structure, since blank pages are correctly caught by the
+    legibility check as "nothing readable here" (see test_image_quality.py).
+    """
     import fitz
     doc = fitz.open()
     for _ in range(num_pages):
-        doc.new_page()
+        page = doc.new_page()
+        for i in range(30):
+            page.insert_text((30, 20 + i * 15), f"Line item {i}    1,234.56    2,345.67", fontsize=9)
     data = doc.tobytes()
     doc.close()
     return data
@@ -118,6 +125,37 @@ def test_upload_gracefully_handles_estimate_failure_for_invalid_pdf():
         assert body["extraction_estimate"] is None
     finally:
         delete_document(body["company_slug"], body["doc_id"])
+
+
+def _blank_pdf_bytes(num_pages: int = 1) -> bytes:
+    import fitz
+    doc = fitz.open()
+    for _ in range(num_pages):
+        doc.new_page()
+    data = doc.tobytes()
+    doc.close()
+    return data
+
+
+def test_upload_rejects_blank_unreadable_pdf():
+    company = _unique_company()
+    resp = _upload(company, content=_blank_pdf_bytes(2))
+    assert resp.status_code == 400
+    assert "blurry" in resp.json()["detail"].lower()
+
+    # Confirm nothing was actually stored for a rejected upload.
+    listing = client.get("/cma/documents")
+    slugs = [c["slug"] for c in listing.json()["companies"]]
+    from app.services.storage import _slugify
+    assert _slugify(company) not in slugs
+
+
+def test_upload_accepts_textful_pdf_past_legibility_check():
+    company = _unique_company()
+    resp = _upload(company, content=_real_pdf_bytes(1))
+    assert resp.status_code == 201
+    body = resp.json()
+    delete_document(body["company_slug"], body["doc_id"])
 
 
 def test_list_company_documents_reflects_uploaded_metadata():

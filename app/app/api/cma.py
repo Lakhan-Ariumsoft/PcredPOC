@@ -24,6 +24,7 @@ from app.services.cma_extraction_service import (
 )
 from app.core_config import get_settings
 from app.utils.fy_detector import get_financial_year
+from app.utils.image_quality import check_document_legibility
 
 logger = logging.getLogger(__name__)
 
@@ -240,6 +241,24 @@ async def upload_document(
     data = _read_bytes(file)
     if start_page is not None and end_page is not None and start_page > end_page:
         raise HTTPException(400, "start_page must be <= end_page.")
+
+    # Reject unreadable scans before spending anything on OCR/extraction.
+    # Checks the declared start_page range if given, else the first pages —
+    # heuristic (variance-of-Laplacian), not a guarantee; see
+    # app/utils/image_quality.py for the threshold and its caveats.
+    try:
+        legibility = check_document_legibility(data, start_page=start_page)
+    except Exception as e:
+        logger.warning(f"Legibility check failed, proceeding without it: {e}")
+        legibility = {"blurry": False, "checked_pages": 0, "scores": []}
+    if legibility["blurry"]:
+        raise HTTPException(
+            400,
+            f"This document appears too blurry or low-quality to process reliably "
+            f"(checked {legibility['checked_pages']} page(s), sharpness scores "
+            f"{legibility['scores']} — all below threshold). Please upload a clearer scan."
+        )
+
     try:
         meta = store_document(
             company_name, file.filename, data,
