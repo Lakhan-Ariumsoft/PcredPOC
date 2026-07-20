@@ -13,6 +13,7 @@ import asyncio
 from pathlib import Path
 from typing import Optional
 
+from app.exceptions import LLMQuotaExceededError
 from app.schemas.cma_fields import CMA_SECTIONS, CMA_FIELDS_FLAT
 from app.services.client_factory import get_llm_adapter
 from app.utils.json_tools import parse_json_object
@@ -781,6 +782,14 @@ async def _openai_call(
                 temperature=0.0
             )
             return parse_json_object(raw)
+        except LLMQuotaExceededError:
+            # Retrying a zero-balance/quota-exhausted account can't succeed —
+            # every one of the ~190 calls in this document would otherwise
+            # burn 3 retries with growing backoff before silently returning
+            # nulls. Fail this call immediately and let it propagate all the
+            # way up so the job ends in a clear "error" state instead of a
+            # near-empty "success".
+            raise
         except Exception as e:
             if raw:
                 import sys
@@ -1310,6 +1319,12 @@ async def _run_second_pass(
                     logger.info(f"  Second pass batch {batch_start//BATCH+1}: {found_now}/{len(batch_fields)} recovered")
                     break
 
+                except LLMQuotaExceededError:
+                    # Every remaining call in this second pass (and every
+                    # other section/batch still queued) would fail on the
+                    # same zero-balance account — stop immediately instead
+                    # of retrying and looping through all of them first.
+                    raise
                 except Exception as e:
                     logger.error(f"Second pass error for {label}: {e}")
                     await asyncio.sleep(5 * (attempt + 1))

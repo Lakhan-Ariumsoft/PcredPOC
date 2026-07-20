@@ -5,7 +5,27 @@ from typing import Any
 import fitz
 import httpx
 
-from app.exceptions import LLMTimeoutError
+from app.exceptions import LLMQuotaExceededError, LLMTimeoutError
+
+# Substrings that show up across providers' out-of-credit/quota responses.
+# OpenAI's is the canonical shape ({"error": {"code": "insufficient_quota", ...}}
+# at HTTP 429), but this also catches text-only variants from other
+# OpenAI-compatible endpoints (HF Inference Endpoints, etc.) that don't
+# follow the exact same JSON structure.
+_QUOTA_ERROR_MARKERS = (
+    "insufficient_quota",
+    "exceeded your current quota",
+    "you have run out of credits",
+    "credit balance is too low",
+    "billing_hard_limit_reached",
+)
+
+
+def _is_quota_exhausted_error(status_code: int, body_text: str) -> bool:
+    if status_code not in (402, 429):
+        return False
+    body_lower = body_text.lower()
+    return any(marker in body_lower for marker in _QUOTA_ERROR_MARKERS)
 
 
 class LMStudioClient:
@@ -66,6 +86,12 @@ class LMStudioClient:
             import sys
             sys.stderr.write(f"LM Studio error response: {exc.response.text}\n")
             sys.stderr.flush()
+            if _is_quota_exhausted_error(exc.response.status_code, exc.response.text):
+                raise LLMQuotaExceededError(
+                    f"The {self.model} provider rejected the request for billing/quota reasons "
+                    f"(HTTP {exc.response.status_code}) — no credits/quota remaining. "
+                    "Add billing credits or switch LLM_PROVIDER, then retry."
+                ) from exc
             raise exc
         data = response.json()
         return data["choices"][0]["message"]["content"]
