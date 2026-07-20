@@ -359,9 +359,19 @@ def clear_one_ai_cache(doc_id: str):
 # ── Extraction Endpoints ──────────────────────────────────────────────────────
 
 @router.post("/cma/extract/trigger/{company_slug}")
-async def trigger_extraction(company_slug: str, background_tasks: BackgroundTasks, raw: bool = False):
+async def trigger_extraction(
+    company_slug: str, background_tasks: BackgroundTasks, raw: bool = False, force: bool = False,
+):
     """
     Trigger extraction job in the background. Returns job_id instantly.
+
+    force=false (default): if a job for this exact set of documents already
+    completed, return that job's status (including percent=100 and how to
+    fetch the result) instead of silently starting a brand-new extraction —
+    calling this endpoint again after it already finished used to always
+    report "Started..." at 0% again, which looked like nothing had actually
+    completed even though it had. force=true always starts fresh (e.g.
+    after uploading an additional document for the same company).
     """
     info = list_company_documents(company_slug)
     if info is None:
@@ -375,10 +385,31 @@ async def trigger_extraction(company_slug: str, background_tasks: BackgroundTask
     if not docs:
         raise HTTPException(404, f"No documents uploaded for '{company_slug}'.")
 
-    with _jobs_lock:
-        for jid, job in _jobs.items():
-            if job.get("company_slug") == company_slug and job.get("status") in ("pending", "running"):
-                return {"job_id": jid, "status": job["status"], "message": "Job already running"}
+    current_doc_ids = sorted(d["doc_id"] for d in docs)
+
+    if not force:
+        with _jobs_lock:
+            for jid, job in _jobs.items():
+                if job.get("company_slug") != company_slug:
+                    continue
+                status = job.get("status")
+                if status in ("pending", "running"):
+                    total = job.get("total", 1) or 1
+                    return {
+                        "job_id": jid, "status": status, "total": total,
+                        "percent": round(job.get("progress", 0) / total * 100),
+                        "message": "Job already running. Poll /cma/extract/status/" + jid,
+                    }
+                if status == "done" and job.get("doc_ids") == current_doc_ids:
+                    return {
+                        "job_id": jid, "status": "done", "total": job.get("total", len(docs)),
+                        "percent": 100,
+                        "message": (
+                            "Already extracted for this exact document set. "
+                            f"GET /cma/extract/result/{jid} or /cma/extract/excel/job/{jid} for it, "
+                            "or call this endpoint with force=true to re-extract from scratch."
+                        ),
+                    }
 
     job_id = uuid.uuid4().hex
     _job_set(job_id, {
@@ -388,6 +419,7 @@ async def trigger_extraction(company_slug: str, background_tasks: BackgroundTask
         "status":       "pending",
         "progress":     0,
         "total":        len(docs),
+        "doc_ids":      current_doc_ids,
         "message":      "Starting...",
         "raw":          raw,
         "result":       None,
@@ -403,7 +435,7 @@ async def trigger_extraction(company_slug: str, background_tasks: BackgroundTask
 
     logger.info(f"Started job {job_id} for {company_slug} ({len(docs)} docs) raw={raw}")
     return {
-        "job_id": job_id, "status": "pending", "total": len(docs),
+        "job_id": job_id, "status": "pending", "total": len(docs), "percent": 0,
         "message": f"Started for {len(docs)} doc(s). Poll /cma/extract/status/{job_id}",
     }
 
@@ -466,7 +498,9 @@ def list_jobs():
         404: {"description": "Company not found or no documents uploaded"},
     },
 )
-async def extract_company_sync(company_slug: str, background_tasks: BackgroundTasks, raw: bool = False):
+async def extract_company_sync(
+    company_slug: str, background_tasks: BackgroundTasks, raw: bool = False, force: bool = False,
+):
     """
     Starts (or reuses) a background extraction job instead of running the
     full pipeline inline — see download_cma_excel's docstring for why: a
@@ -474,10 +508,15 @@ async def extract_company_sync(company_slug: str, background_tasks: BackgroundTa
     server for every other client, which surfaces as a misleading network
     error rather than a clean timeout.
 
+    If this exact document set was already fully extracted, returns that
+    completed job (status="done", percent=100) instead of restarting from
+    0% — pass force=true to re-extract from scratch regardless.
+
     Poll GET /cma/extract/status/{job_id}, then GET /cma/extract/result/{job_id}.
     """
-    result = await trigger_extraction(company_slug, background_tasks, raw)
-    result["result_hint"] = f"Once status is 'done', GET /cma/extract/result/{result['job_id']} for the JSON."
+    result = await trigger_extraction(company_slug, background_tasks, raw, force)
+    if result.get("status") != "done":
+        result["result_hint"] = f"Once status is 'done', GET /cma/extract/result/{result['job_id']} for the JSON."
     return result
 
 
@@ -507,7 +546,9 @@ async def extract_single_doc(company_slug: str, doc_id: str, raw: bool = False):
         404: {"description": "Company or documents not found"},
     },
 )
-async def download_cma_excel(company_slug: str, background_tasks: BackgroundTasks, raw: bool = False):
+async def download_cma_excel(
+    company_slug: str, background_tasks: BackgroundTasks, raw: bool = False, force: bool = False,
+):
     """
     Starts (or reuses) a background extraction job for this company instead
     of running the OCR+LLM pipeline inline.
@@ -522,14 +563,23 @@ async def download_cma_excel(company_slug: str, background_tasks: BackgroundTask
     CORS-looking error, not a clean timeout. That's almost certainly what
     was happening — not an actual CORS problem.
 
+    If this exact document set was already fully extracted, returns that
+    completed job (status="done", percent=100) with a direct download link
+    instead of restarting extraction from 0% again — pass force=true to
+    re-extract from scratch regardless (e.g. after uploading a new document
+    for this company).
+
     Poll GET /cma/extract/status/{job_id} until status is "done", then call
     GET /cma/extract/excel/job/{job_id} to get the file — that download is
     instant since it reuses the completed job's cached result.
     """
-    result = await trigger_extraction(company_slug, background_tasks, raw)
-    result["excel_download_hint"] = (
-        f"Once status is 'done', GET /cma/extract/excel/job/{result['job_id']} to download the file."
-    )
+    result = await trigger_extraction(company_slug, background_tasks, raw, force)
+    if result.get("status") != "done":
+        result["excel_download_hint"] = (
+            f"Once status is 'done', GET /cma/extract/excel/job/{result['job_id']} to download the file."
+        )
+    else:
+        result["excel_download_hint"] = f"GET /cma/extract/excel/job/{result['job_id']} to download the file now."
     return result
 
 
