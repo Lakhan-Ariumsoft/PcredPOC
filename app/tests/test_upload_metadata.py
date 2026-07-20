@@ -172,3 +172,25 @@ def test_list_company_documents_reflects_uploaded_metadata():
         assert doc["end_page"] == 3
     finally:
         delete_document(body["company_slug"], body["doc_id"])
+
+
+def test_company_slug_lookups_are_case_insensitive_across_endpoints():
+    """
+    Uploading under one casing of the company name must be findable via
+    GET /cma/documents/{company_slug} and DELETE .../{company_slug}/{doc_id}
+    no matter how the caller capitalizes the slug in the URL later.
+    """
+    company = f"Charbhuja {_unique_company()}"
+    resp = _upload(company, content=_real_pdf_bytes(1))
+    assert resp.status_code == 201
+    body = resp.json()
+    slug = body["company_slug"]  # already lowercase from _slugify
+
+    try:
+        for variant in (slug.upper(), slug.title()):
+            got = client.get(f"/cma/documents/{variant}")
+            assert got.status_code == 200, f"lookup failed for case variant {variant!r}"
+            assert got.json()["slug"] == slug
+    finally:
+        deleted = client.delete(f"/cma/documents/{slug.upper()}/{body['doc_id']}")
+        assert deleted.status_code == 200

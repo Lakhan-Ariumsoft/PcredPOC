@@ -88,6 +88,27 @@ def test_list_functions_surface_metadata_fields():
         delete_document(meta["company_slug"], meta["doc_id"])
 
 
+def test_lookups_are_case_insensitive_on_company_slug():
+    """
+    _slugify() always lowercases on store, but a company_slug arriving
+    later as a URL path parameter is passed through exactly as typed.
+    Every lookup function must match regardless of case.
+    """
+    meta = store_document(_unique_company("Charbhuja"), "financials.pdf", _pdf_bytes("e"))
+    slug = meta["company_slug"]  # already lowercase, e.g. "charbhuja-a1b2c3d4"
+    try:
+        for variant in (slug.upper(), slug.title(), f"  {slug.upper()}  "):
+            fetched = get_document_meta(variant, meta["doc_id"])
+            assert fetched is not None, f"get_document_meta missed case variant: {variant!r}"
+
+            listing = list_company_documents(variant)
+            assert listing is not None, f"list_company_documents missed case variant: {variant!r}"
+            assert listing["slug"] == slug
+    finally:
+        # deletion must also be case-insensitive
+        assert delete_document(slug.upper(), meta["doc_id"]) is True
+
+
 def test_list_functions_handle_legacy_entries_without_metadata_keys():
     """
     Registry entries written before this feature existed won't have the

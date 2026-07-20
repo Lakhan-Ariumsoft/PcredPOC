@@ -366,6 +366,11 @@ async def trigger_extraction(company_slug: str, background_tasks: BackgroundTask
     info = list_company_documents(company_slug)
     if info is None:
         raise HTTPException(404, f"Company '{company_slug}' not found.")
+    # Canonical lowercase slug from the registry — list_company_documents()
+    # already matched case-insensitively, so this is what everything
+    # downstream (job store, dedup check, background worker) should use
+    # instead of however the caller happened to type the URL.
+    company_slug = info["slug"]
     docs = info.get("documents", [])
     if not docs:
         raise HTTPException(404, f"No documents uploaded for '{company_slug}'.")

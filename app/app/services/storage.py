@@ -38,6 +38,18 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _normalize_slug(company_slug: str) -> str:
+    """
+    _slugify() always lowercases on upload, so a stored slug is always
+    lowercase — but a company_slug arriving later as a URL path parameter
+    (GET/DELETE endpoints) is passed through as literally typed, with no
+    re-slugification. Without this, "Charbhuja" and "charbhuja" look like
+    two different companies to a plain dict lookup even though they're the
+    same one. Every lookup function below normalizes through this first.
+    """
+    return (company_slug or "").strip().lower()
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -153,6 +165,7 @@ def store_document(
 
 def get_document_path(company_slug: str, doc_id: str) -> Optional[Path]:
     """Return the absolute path for a stored document, or None if not found."""
+    company_slug = _normalize_slug(company_slug)
     with FileLock(str(LOCK_FILE)):
         registry = _read_registry()
         company  = registry["companies"].get(company_slug)
@@ -171,6 +184,7 @@ def get_document_meta(company_slug: str, doc_id: str) -> Optional[dict]:
     Includes the extraction hints (entity_type/start_page/end_page/notes)
     supplied at upload time, in addition to the base file metadata.
     """
+    company_slug = _normalize_slug(company_slug)
     with FileLock(str(LOCK_FILE)):
         registry = _read_registry()
         company  = registry["companies"].get(company_slug)
@@ -227,6 +241,7 @@ def list_company_documents(company_slug: str) -> Optional[dict]:
     """
     Return documents for a single company, or None if slug not found.
     """
+    company_slug = _normalize_slug(company_slug)
     with FileLock(str(LOCK_FILE)):
         registry = _read_registry()
         company  = registry["companies"].get(company_slug)
@@ -260,6 +275,7 @@ def delete_document(company_slug: str, doc_id: str) -> bool:
     Remove a document from the registry and disk.
     Returns True if deleted, False if not found.
     """
+    company_slug = _normalize_slug(company_slug)
     with FileLock(str(LOCK_FILE)):
         registry  = _read_registry()
         company   = registry["companies"].get(company_slug)
